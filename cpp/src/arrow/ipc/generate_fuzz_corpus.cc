@@ -19,6 +19,7 @@
 // containing example record batches.  Those are used as fuzzing seeds
 // to make fuzzing more efficient.
 
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -123,8 +124,12 @@ Status DoMain(bool is_stream_format, const std::string& out_dir) {
   RETURN_NOT_OK(CreateDir(dir_fn));
 
   int sample_num = 1;
-  auto sample_name = [&]() -> std::string {
-    return "batch-" + std::to_string(sample_num++);
+  auto sample_name = [&](const std::string& suffix = "") -> std::string {
+    auto name = "batch-" + std::to_string(sample_num++);
+    if (!suffix.empty()) {
+      name += "-" + suffix;
+    }
+    return name;
   };
 
   // codec 0 is uncompressed
@@ -145,6 +150,37 @@ Status DoMain(bool is_stream_format, const std::string& out_dir) {
       ARROW_ASSIGN_OR_RAISE(auto sample_fn, dir_fn.Join(sample_name()));
       std::cerr << sample_fn.ToString() << std::endl;
       ARROW_ASSIGN_OR_RAISE(auto file, io::FileOutputStream::Open(sample_fn.ToString()));
+      RETURN_NOT_OK(file->Write(buf));
+      RETURN_NOT_OK(file->Close());
+    }
+  }
+
+  // Emit variants prefixed with a fuzz option header (see
+  // DecodeFuzzIpcHeader() in reader.cc for the layout), so that the reader
+  // and writer option space is exercised from the seed corpus.  Each header
+  // requests a specific write codec and/or foreign endianness for the
+  // round-trip write.
+  struct HeaderSpec {
+    const char* name;
+    std::array<uint8_t, 8> header;
+  };
+  const HeaderSpec header_specs[] = {
+      {"header-lz4", {0xFA, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}},
+      {"header-zstd", {0xFA, 0x03, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00}},
+      {"header-foreign-endian", {0xFA, 0x03, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}},
+      {"header-foreign-endian-zstd", {0xFA, 0x03, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00}},
+      {"header-no-swap", {0xFA, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+      {"header-aligned64", {0xFA, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00}},
+  };
+  for (const auto& batch : batches) {
+    RETURN_NOT_OK(batch->ValidateFull());
+    for (const auto& spec : header_specs) {
+      ARROW_ASSIGN_OR_RAISE(auto buf, SerializeRecordBatch(batch, IpcWriteOptions::Defaults(),
+                                                           is_stream_format));
+      ARROW_ASSIGN_OR_RAISE(auto sample_fn, dir_fn.Join(sample_name(spec.name)));
+      std::cerr << sample_fn.ToString() << std::endl;
+      ARROW_ASSIGN_OR_RAISE(auto file, io::FileOutputStream::Open(sample_fn.ToString()));
+      RETURN_NOT_OK(file->Write(spec.header.data(), static_cast<int64_t>(spec.header.size())));
       RETURN_NOT_OK(file->Write(buf));
       RETURN_NOT_OK(file->Close());
     }

@@ -2823,16 +2823,171 @@ IpcReadOptions FuzzingOptions() {
   return options;
 }
 
+// Packed header prefixing the fuzz payload, used to explore the IPC reader
+// and writer option space (same convention as the CSV, JSON and compute
+// fuzzers).  All option values are total functions of the header bytes.
+// Inputs without the marker byte are read with the default options and
+// written back out with the default writer options.
+//
+// Header layout:
+//   [0] marker 0xFA
+//   [1] read option flags (bit 0: ensure_native_endian, bit 1: use_threads,
+//       bits 2-3: included_fields mode)
+//   [2] more read option flags (bits 0-1: max_recursion_depth selector,
+//       bit 2: ensure 64-byte alignment)
+//   [3] write codec selector (0=none, 1=LZ4_FRAME, 2=ZSTD)
+//   [4] write option flags (bit 0: write with foreign endianness)
+//   [5..7] reserved
+constexpr int64_t kIpcFuzzHeaderSize = 8;
+constexpr uint8_t kIpcFuzzMarker = 0xFA;
+
+struct FuzzIpcInput {
+  const uint8_t* data;
+  int64_t size;
+  IpcReadOptions read_options;
+  int write_codec = 0;
+  bool write_foreign_endianness = false;
+};
+
+FuzzIpcInput DecodeFuzzIpcHeader(const uint8_t* data, int64_t size) {
+  FuzzIpcInput input{data, size, FuzzingOptions()};
+  if (size > kIpcFuzzHeaderSize && data[0] == kIpcFuzzMarker) {
+    input.data = data + kIpcFuzzHeaderSize;
+    input.size = size - kIpcFuzzHeaderSize;
+    input.read_options.ensure_native_endian = (data[1] & 0x01) != 0;
+    input.read_options.use_threads = (data[1] & 0x02) != 0;
+    switch ((data[1] >> 2) % 3) {
+      case 1:
+        input.read_options.included_fields = {0};
+        break;
+      case 2:
+        input.read_options.included_fields = {0, 1};
+        break;
+      default:
+        break;
+    }
+    switch (data[2] % 4) {
+      case 0:
+        input.read_options.max_recursion_depth = kMaxNestingDepth;
+        break;
+      case 1:
+        input.read_options.max_recursion_depth = 1;
+        break;
+      case 2:
+        input.read_options.max_recursion_depth = 5;
+        break;
+      case 3:
+        input.read_options.max_recursion_depth = 100;
+        break;
+    }
+    input.read_options.ensure_alignment =
+        (data[2] & 0x04) ? Alignment::k64ByteAlignment : Alignment::kAnyAlignment;
+    input.write_codec = data[3] % 3;
+    input.write_foreign_endianness = (data[4] & 0x01) != 0;
+  }
+  return input;
+}
+
+// Write the given batches back out with the fuzz-selected writer options,
+// read the result back and compare it with the original read.  This
+// exercises the IPC writer path, which is otherwise never called by the
+// fuzz targets.
+//
+// The comparison only happens when the reader converts to native
+// endianness; with ensure_native_endian=false the buffers legitimately
+// keep their foreign endianness and cannot be compared value-wise.
+Status FuzzIpcRoundtripWrite(const FuzzIpcInput& input,
+                             const std::shared_ptr<Schema>& schema,
+                             const std::vector<RecordBatchWithMetadata>& batches) {
+  if (schema == nullptr || batches.empty()) {
+    return Status::OK();
+  }
+  for (const auto& batch : batches) {
+    if (batch.batch == nullptr) {
+      // Custom metadata-only entries cannot be written back out
+      return Status::OK();
+    }
+  }
+
+  IpcWriteOptions write_options = IpcWriteOptions::Defaults();
+  write_options.memory_pool = input.read_options.memory_pool;
+  write_options.use_threads = input.read_options.use_threads;
+  static const auto lz4_codec = []() -> std::shared_ptr<util::Codec> {
+    auto maybe_codec = util::Codec::Create(Compression::LZ4_FRAME);
+    if (!maybe_codec.ok()) {
+      return nullptr;
+    }
+    return std::shared_ptr<util::Codec>(maybe_codec->release());
+  }();
+  static const auto zstd_codec = []() -> std::shared_ptr<util::Codec> {
+    auto maybe_codec = util::Codec::Create(Compression::ZSTD);
+    if (!maybe_codec.ok()) {
+      return nullptr;
+    }
+    return std::shared_ptr<util::Codec>(maybe_codec->release());
+  }();
+  switch (input.write_codec) {
+    case 1:
+      write_options.codec = lz4_codec;
+      break;
+    case 2:
+      write_options.codec = zstd_codec;
+      break;
+    default:
+      break;
+  }
+
+  auto write_schema = schema;
+  if (input.write_foreign_endianness) {
+    write_schema = schema->WithEndianness(Endianness::Native == Endianness::Little
+                                              ? Endianness::Big
+                                              : Endianness::Little);
+  }
+
+  ARROW_ASSIGN_OR_RAISE(auto sink,
+                        io::BufferOutputStream::Create(1024, write_options.memory_pool));
+  ARROW_ASSIGN_OR_RAISE(auto writer, MakeStreamWriter(sink, write_schema, write_options));
+  for (const auto& batch : batches) {
+    RETURN_NOT_OK(writer->WriteRecordBatch(*batch.batch));
+  }
+  RETURN_NOT_OK(writer->Close());
+  ARROW_ASSIGN_OR_RAISE(auto written, sink->Finish());
+
+  // Read the written stream back and compare with the original read
+  io::BufferReader output_reader(written);
+  ARROW_ASSIGN_OR_RAISE(auto reader,
+                        RecordBatchStreamReader::Open(&output_reader, input.read_options));
+  std::vector<RecordBatchWithMetadata> reread;
+  while (true) {
+    ARROW_ASSIGN_OR_RAISE(auto batch, reader->ReadNext());
+    if (!batch.batch && !batch.custom_metadata) {
+      // EOS
+      break;
+    }
+    RETURN_NOT_OK(ValidateFuzzBatch(batch));
+    reread.push_back(batch);
+  }
+  if (reread.size() != batches.size()) {
+    return Status::Invalid("Round-trip changed the number of batches");
+  }
+  if (input.read_options.ensure_native_endian) {
+    return CompareFuzzBatches(batches, reread);
+  }
+  return Status::OK();
+}
+
 }  // namespace
 
 Status FuzzIpcStream(const uint8_t* data, int64_t size) {
-  auto buffer = std::make_shared<Buffer>(data, size);
+  auto input = DecodeFuzzIpcHeader(data, size);
+  auto buffer = std::make_shared<Buffer>(input.data, input.size);
   io::BufferReader buffer_reader(buffer);
 
   std::shared_ptr<RecordBatchReader> batch_reader;
-  ARROW_ASSIGN_OR_RAISE(batch_reader,
-                        RecordBatchStreamReader::Open(&buffer_reader, FuzzingOptions()));
+  ARROW_ASSIGN_OR_RAISE(
+      batch_reader, RecordBatchStreamReader::Open(&buffer_reader, input.read_options));
   Status st;
+  std::vector<RecordBatchWithMetadata> batches;
 
   while (true) {
     ARROW_ASSIGN_OR_RAISE(auto batch, batch_reader->ReadNext());
@@ -2841,13 +2996,20 @@ Status FuzzIpcStream(const uint8_t* data, int64_t size) {
       break;
     }
     st &= ValidateFuzzBatch(batch);
+    batches.push_back(batch);
+  }
+
+  if (st.ok()) {
+    // Write the batches back out and read them again (IPC writer round-trip)
+    st &= FuzzIpcRoundtripWrite(input, batch_reader->schema(), batches);
   }
 
   return st;
 }
 
 Status FuzzIpcFile(const uint8_t* data, int64_t size) {
-  auto buffer = std::make_shared<Buffer>(data, size);
+  auto input = DecodeFuzzIpcHeader(data, size);
+  auto buffer = std::make_shared<Buffer>(input.data, input.size);
 
   Status final_status;
 
@@ -2864,7 +3026,7 @@ Status FuzzIpcFile(const uint8_t* data, int64_t size) {
     RETURN_NOT_OK(
         buffer_reader.Advance(bit_util::RoundUpToMultipleOf8(kArrowMagicBytes.length())));
     ARROW_ASSIGN_OR_RAISE(auto batch_reader, RecordBatchStreamReader::Open(
-                                                 &buffer_reader, FuzzingOptions()));
+                                                 &buffer_reader, input.read_options));
 
     std::vector<RecordBatchWithMetadata> batches;
     while (true) {
@@ -2882,7 +3044,7 @@ Status FuzzIpcFile(const uint8_t* data, int64_t size) {
   auto do_file_read = [&](bool pre_buffer) -> Result<IpcReadResult> {
     io::BufferReader buffer_reader(buffer);
     ARROW_ASSIGN_OR_RAISE(auto batch_reader,
-                          RecordBatchFileReader::Open(&buffer_reader, FuzzingOptions()));
+                          RecordBatchFileReader::Open(&buffer_reader, input.read_options));
     if (pre_buffer) {
       // Pre-buffer all record batches
       RETURN_NOT_OK(batch_reader->PreBufferMetadata(/*indices=*/{}));
@@ -2960,6 +3122,11 @@ Status FuzzIpcFile(const uint8_t* data, int64_t size) {
         compare_result(*maybe_stream_result);
       }
     }
+  }
+  if (final_status.ok() && maybe_read_result.has_value()) {
+    // Write the batches back out and read them again (IPC writer round-trip)
+    final_status &= FuzzIpcRoundtripWrite(input, maybe_read_result->schema,
+                                          maybe_read_result->batches);
   }
   return final_status;
 }
